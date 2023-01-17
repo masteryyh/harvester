@@ -411,7 +411,7 @@ EOF
   wait_kubevirt harvester-system kubevirt $REPO_KUBEVIRT_VERSION
 }
 
-upgrade_monitoring() {
+upgrade_managedchart_monitoring_and_crd() {
   echo "Upgrading Monitoring"
 
   pre_generation_monitoring=$(kubectl get managedcharts.management.cattle.io rancher-monitoring -n fleet-local -o=jsonpath='{.status.observedGeneration}')
@@ -447,6 +447,76 @@ EOF
 
   wait_rollout cattle-monitoring-system daemonset rancher-monitoring-prometheus-node-exporter
   wait_rollout cattle-monitoring-system deployment rancher-monitoring-operator
+}
+
+upgrade_managedchart_monitoring_crd() {
+  nm=rancher-monitoring-crd
+  echo "Upgrading Managedchart $nm"
+
+  pre_version=$(kubectl get managedcharts.management.cattle.io "$nm" -n fleet-local -o=jsonpath='{.spec.version}')
+  if [ "$pre_version" = "$REPO_MONITORING_CHART_VERSION" ]; then
+    echo "the $nm has already been target version $REPO_MONITORING_CHART_VERSION, nothing to upgrade"
+    pause_managed_chart "$nm" "false"
+    return 0
+  fi
+
+  pre_generation_monitoring_crd=$(kubectl get managedcharts.management.cattle.io "$nm" -n fleet-local -o=jsonpath='{.status.observedGeneration}')
+
+  mkdir -p $UPGRADE_TMP_DIR/monitoring
+  cd $UPGRADE_TMP_DIR/monitoring
+
+  cat >"$nm".yaml <<EOF
+spec:
+  version: $REPO_MONITORING_CHART_VERSION
+EOF
+
+  kubectl patch managedcharts.management.cattle.io "$nm" -n fleet-local --patch-file ./"$nm".yaml --type merge
+
+  pause_managed_chart "$nm" "false"
+
+  wait_managed_chart fleet-local "$nm" $REPO_MONITORING_CHART_VERSION $pre_generation_monitoring_crd ready
+}
+
+upgrade_monitoring() {
+  if [ "$UPGRADE_PREVIOUS_VERSION" = "v1.1.1" ] ||  [ "$UPGRADE_PREVIOUS_VERSION" = "v1.1.2" ]; then
+    convert_monitoring_to_addon
+    # there is no version change of rancher-monitoring-crd between release v1.1.1/v1.1.2 and v1.2.0
+    pause_managed_chart rancher-monitoring-crd "true"
+  elif [[ "$UPGRADE_PREVIOUS_VERSION" > "v1.1.2" ]]; then
+    # from v1.2.0, only crd here, rancher-monitoring is upgraded in addons
+    upgrade_managedchart_monitoring_crd
+  else
+    # legacy
+    upgrade_managedchart_monitoring_and_crd
+  fi
+}
+
+upgrade_managedchart_logging_crd() {
+  nm=rancher-logging-crd
+  echo "Upgrading Managedchart $nm"
+
+  pre_version=$(kubectl get managedcharts.management.cattle.io "$nm" -n fleet-local -o=jsonpath='{.spec.version}')
+  if [ "$pre_version" = "$REPO_LOGGING_CHART_VERSION" ]; then
+    echo "the $nm has already been target version $REPO_LOGGING_CHART_VERSION, nothing to upgrade"
+    pause_managed_chart "$nm" "false"
+    return 0
+  fi
+
+  pre_generation_logging_crd=$(kubectl get managedcharts.management.cattle.io "$nm" -n fleet-local -o=jsonpath='{.status.observedGeneration}')
+
+  mkdir -p $UPGRADE_TMP_DIR/logging
+  cd $UPGRADE_TMP_DIR/logging
+
+  cat >"$nm".yaml <<EOF
+spec:
+  version: $REPO_LOGGING_CHART_VERSION
+EOF
+
+  kubectl patch managedcharts.management.cattle.io "$nm" -n fleet-local --patch-file ./"$nm".yaml --type merge
+
+  pause_managed_chart "$nm" "false"
+
+  wait_managed_chart fleet-local "$nm" $REPO_LOGGING_CHART_VERSION $pre_generation_logging_crd ready
 }
 
 loop_wait_rollout_logging_audit() {
@@ -526,54 +596,330 @@ loop_wait_rollout_event() {
   return 0
 }
 
+loop_wait_rollout_monitoring() {
+  local NS=cattle-monitoring-system
+
+  for i in $(seq 1 $1)
+  do
+    local EXIT_CODE=0 # reset each loop
+    sleep 10
+
+    local nm=rancher-monitoring-operator
+    wait_rollout $NS deployment $nm || EXIT_CODE=$?
+    if [ $EXIT_CODE != 0 ]; then
+      echo "continue waiting rollout deployment $nm, $i"
+      continue
+    fi
+
+    local nm=rancher-monitoring-prometheus-adapter
+    wait_rollout $NS deployment $nm || EXIT_CODE=$?
+    if [ $EXIT_CODE != 0 ]; then
+      echo "continue waiting rollout deployment $nm, $i"
+      continue
+    fi
+
+    local nm=rancher-monitoring-kube-state-metrics
+    wait_rollout $NS deployment $nm || EXIT_CODE=$?
+    if [ $EXIT_CODE != 0 ]; then
+      echo "continue waiting rollout deployment $nm, $i"
+      continue
+    fi
+
+    local nm=rancher-monitoring-grafana
+    wait_rollout $NS deployment $nm || EXIT_CODE=$?
+    if [ $EXIT_CODE != 0 ]; then
+      echo "continue waiting rollout deployment $nm, $i"
+      continue
+    fi
+
+    local nm=prometheus-rancher-monitoring-prometheus
+    wait_rollout $NS statefulset $nm || EXIT_CODE=$?
+    if [ $EXIT_CODE != 0 ]; then
+      echo "continue waiting rollout statefulset $nm, $i"
+      continue
+    fi
+
+    # may be disabled
+    #local nm=alertmanager-rancher-monitoring-alertmanager
+    #wait_rollout $NS statefulset $nm || EXIT_CODE=$?
+    #if [ $EXIT_CODE != 0 ]; then
+    #  echo "continue waiting rollout statefulset $nm, $i"
+    #  continue
+    #fi
+
+    local nm=rancher-monitoring-prometheus-node-exporter
+    wait_rollout $NS daemonset $nm || EXIT_CODE=$?
+    if [ $EXIT_CODE != 0 ]; then
+      echo "continue waiting rollout daemonset $nm, $i"
+      continue
+    fi
+
+    break
+  done
+
+  if [ $EXIT_CODE != 0 ]; then
+    echo "fail to wait rollout monitoring"
+    return $EXIT_CODE
+  fi
+
+  echo "success to wait rollout monitoring"
+  return 0
+}
+
+convert_logging_audit_to_addon() {
+  echo "Logging Event Audit: start to convert logging from managedchart to addon"
+  chart_name="rancher-logging"
+  namespace="cattle-logging-system"
+  # check if logging addon is there
+  cnt=$(kubectl get addon.harvesterhci.io -n "$namespace" "$chart_name" --no-headers | wc -l)
+  if [ "$cnt" -gt 0 ]; then
+    echo "logging has already been addon"
+    return 0
+  fi
+
+  src_file=/usr/local/share/addons/logging_addon.yaml
+  if [ ! -f $src_file ]; then
+    echo "there is no $src_file, cannot convert"
+    return 0
+  fi
+
+  # check if logging managedchart is there
+  cnt=$(kubectl get managedchart -n fleet-local $chart_name --no-headers | wc -l)
+
+  # copy config
+  old_config="null"
+  enabled=false
+
+  if [ "$cnt" -gt 0 ]; then
+    enabled=true
+    old_config=$(kubectl get managedchart -n fleet-local "$chart_name" -o yaml | yq -e ".spec.values")
+    echo "copy config from managedchart: $old_config"
+    pod_cnt=$(kubectl get pods -n "$namespace" --no-headers | wc -l)
+    echo "there are $pod_cnt pods in $namespace will be replaced"
+    # pause first, TODO delete
+    # pause_managed_chart "$chart_name" "true"
+    # sleep 10
+    echo "delete managedchart $chart_name"
+    # delete managedchart
+    kubectl delete managedchart -n fleet-local "$chart_name"
+    sleep 20
+
+    # eventtailer needs to be deleted separately
+    et_cnt=$(kubectl get eventtailers.logging-extensions.banzaicloud.io harvester-default --no-headers | wc -l)
+    if [ "$et_cnt" -gt 0 ]; then
+      echo "delete eventtailer harvester-default"
+      kubectl delete eventtailers.logging-extensions.banzaicloud.io harvester-default
+    fi
+
+    # check until all pods are deleted
+    while [ true ]; do
+      pod_cnt=$(kubectl get pods -n "$namespace" --no-headers | wc -l)
+      if [ "$pod_cnt" -gt 0 ]; then
+        date; echo "there are still $pod_cnt pods in $namespace to be deleted"
+        sleep 5
+      else
+        echo "all pods in $namespace are deleted"
+        break
+      fi
+    done
+  fi
+
+  # create tmp addon yaml file
+  target_file="/tmp/logging_addon_tmp.yaml"
+  rm -f $target_file
+  cp $src_file $target_file
+
+  # replace valid existing config
+  if [ "$old_config" != "null" ]; then
+    echo "replace addon valuesContent with saving config"
+    values="$old_config" yq -i e '.spec.valuesContent=strenv(values)' $target_file
+  fi
+
+  if [ $enabled = true ]; then
+    echo "enable logging addon"
+    yq -i e '.spec.enabled = true' $target_file
+  else
+    echo "disable logging addon"
+    yq -i e '.spec.enabled = false' $target_file
+  fi
+
+  echo "final logging addon yaml file"
+  cat $target_file
+
+  kubectl apply -f $target_file
+  rm -f $target_file
+  kubectl get addon.harvesterhci.io -A
+
+  if [ $enabled = true ]; then
+    # wait for addon to be applied
+    echo "wait for rollout of logging and audit"
+    sleep 30
+    # loop wait for at most 6 minutes (36 * 10s)
+    loop_wait_rollout_logging_audit 36
+
+    pod_cnt=$(kubectl get pods -n "$namespace" --no-headers | wc -l)
+    echo "there are $pod_cnt pods in $namespace after upgrade"
+  fi
+  echo "Logging Event Audit: finish converting"
+}
+
+convert_monitoring_to_addon() {
+  echo "Monitoring: start to convert monitoring from managedchart to addon"
+  chart_name="rancher-monitoring"
+  namespace="cattle-monitoring-system"
+  # check if monitoring addon is there
+  cnt=$(kubectl get addon.harvesterhci.io -n "$namespace" "$chart_name" --no-headers | wc -l)
+  if [ "$cnt" -gt 0 ]; then
+    echo "monitoring has already been addon"
+    return 0
+  fi
+
+  src_file=/usr/local/share/addons/monitoring_addon.yaml
+  if [ ! -f $src_file ]; then
+    echo "there is no $src_file, cannot convert"
+    return 0
+  fi
+
+  # check if monitoring managedchart is there
+  cnt=$(kubectl get managedchart -n fleet-local "$chart_name" --no-headers | wc -l)
+
+  # copy config
+  old_config="null"
+  enabled=false
+
+  if [ "$cnt" -gt 0 ]; then
+    enabled=true
+    old_config=$(kubectl get managedchart -n fleet-local "$chart_name" -o yaml | yq -e ".spec.values")
+    echo "copy config from managedchart: $old_config"
+    pod_cnt=$(kubectl get pods -n "$namespace" --no-headers | wc -l)
+    echo "there are $pod_cnt pods in $namespace will be replaced"
+    # pause first, TODO delete
+    # pause_managed_chart "$chart_name" "true"
+    # sleep 10
+    echo "delete managedchart $chart_name"
+    # delete managedchart
+    kubectl delete managedchart -n fleet-local "$chart_name"
+
+    # check until all pods are deleted
+    while [ true ]; do
+      pod_cnt=$(kubectl get pods -n "$namespace" --no-headers | wc -l)
+      if [ "$pod_cnt" -gt 0 ]; then
+        date; echo "there are still $pod_cnt pods in $namespace to be deleted"
+        sleep 5
+      else
+        echo "all pods in $namespace are deleted"
+        break
+      fi
+    done
+  fi
+
+  # create tmp addon yaml file
+  target_file="/tmp/monitoring_addon_tmp.yaml"
+  rm -f $target_file
+  cp $src_file $target_file
+
+  # replace valid existing config
+  if [ "$old_config" != "null" ]; then
+    echo "replace addon valuesContent with saving config"
+    values="$old_config" yq -i e '.spec.valuesContent=strenv(values)' $target_file
+  else
+    # replace the replace_with_vip field in add yaml file
+    # use sed to replace sub-string in the valuesContent, it is not easily done in yq
+    detect_harvester_vip
+    if [ -n "$HARVESTER_VIP" ]; then
+      echo "replace the 'replace_with_vip' with $HARVESTER_VIP in $target_file"
+      sed -i "s/replace_with_vip/$HARVESTER_VIP/" $target_file
+    else
+      echo "detect vip fail, does not replace the 'replace_with_vip' in $target_file"
+    fi
+  fi
+
+  if [ $enabled = true ]; then
+    echo "enable monitoring addon"
+    yq -i e '.spec.enabled = true' $target_file
+  else
+    echo "disable monitoring addon"
+    yq -i e '.spec.enabled = false' $target_file
+  fi
+
+  echo "final monitoring addon yaml file"
+  cat $target_file
+
+  kubectl apply -f $target_file
+  rm -f $target_file
+  kubectl get addon.harvesterhci.io -A
+
+  if [ $enabled = true ]; then
+    echo "wait for rollout of monitoring"
+    sleep 30
+    # loop wait for at most 6 minutes (36 * 10s)
+    loop_wait_rollout_monitoring 36
+
+    pod_cnt=$(kubectl get pods -n "$namespace" --no-headers | wc -l)
+    echo "there are $pod_cnt pods in $namespace after upgrade"
+  fi
+  echo "Monitoring: finish converting"
+}
+
+upgrade_logging_event_audit_new_feature() {
+  # from v1.0.3 to v1.1.0, logging, event, audit are enabled by default
+  echo "Logging Event Audit: start to upgrade manifest"
+
+  # prepare a malformed yaml file, make sure it is effectively replaced
+  echo "to-be-replaced-file" > rancher-logging.yaml
+
+  # reuse frame work to generate yaml file
+  upgrade_managed_chart_from_version $UPGRADE_PREVIOUS_VERSION rancher-logging rancher-logging.yaml
+
+  echo "Apply resource file of logging and audit"
+
+  kubectl apply -f ./rancher-logging.yaml
+
+  # wait for managedchart to be applied
+  sleep 50
+
+  echo "Wait for rollout of logging and audit"
+  # loop wait for at most 6 minutes (36 * 10s)
+  loop_wait_rollout_logging_audit 36
+
+  # due to error: unable to recognize "./rancher-logging.yaml": no matches for kind "EventTailer" in version "logging-extensions.banzaicloud.io/v1alpha1"
+  # the eventtailer needs to be deployed after the managedcharts are deployed
+
+  # prepare a malformed yaml file, make sure it is effectively replaced
+  echo "to-be-replaced-file" > rancher-logging.yaml
+
+  # reuse frame work to generate yaml file
+  # rancher-logging_event-extension is reusing chart rancher-logging, but as an extension for event
+  upgrade_managed_chart_from_version $UPGRADE_PREVIOUS_VERSION rancher-logging_event-extension rancher-logging.yaml
+
+  echo "Apply resource file of event"
+
+  kubectl apply -f ./rancher-logging.yaml
+
+  # wait few seconds
+  sleep 20
+
+  echo "Wait for rollout of event"
+  # loop wait for at most 3 minutes (18 * 10s)
+  loop_wait_rollout_event 18
+
+  echo "Logging Event Audit: finish upgrading manifest"
+}
 
 upgrade_logging_event_audit() {
   # from v1.0.3, logging, event, audit are enabled by default
   echo "The current version is $UPGRADE_PREVIOUS_VERSION, will check Logging Event Audit upgrade manifest option"
 
   if test "$UPGRADE_PREVIOUS_VERSION" = "v1.0.3"; then
-    echo "Logging Event Audit: start to upgrade manifest"
-
-    # prepare a malformed yaml file, make sure it is effectively replaced
-    echo "to-be-replaced-file" > rancher-logging.yaml
-
-    # reuse frame work to generate yaml file
-    upgrade_managed_chart_from_version $UPGRADE_PREVIOUS_VERSION rancher-logging rancher-logging.yaml
-
-    echo "Apply resource file of logging and audit"
-
-    kubectl apply -f ./rancher-logging.yaml
-
-    # wait for managedchart to be applied
-    sleep 50
-
-    echo "Wait for rollout of logging and audit"
-    # loop wait for at most 6 minutes (36 * 10s)
-    loop_wait_rollout_logging_audit 36
-
-    # due to error: unable to recognize "./rancher-logging.yaml": no matches for kind "EventTailer" in version "logging-extensions.banzaicloud.io/v1alpha1"
-    # the eventtailer needs to be deployed after the managedcharts are deployed
-
-    # prepare a malformed yaml file, make sure it is effectively replaced
-    echo "to-be-replaced-file" > rancher-logging.yaml
-
-    # reuse frame work to generate yaml file
-    # rancher-logging_event-extension is reusing chart rancher-logging, but as an extension for event
-    upgrade_managed_chart_from_version $UPGRADE_PREVIOUS_VERSION rancher-logging_event-extension rancher-logging.yaml
-
-    echo "Apply resource file of event"
-
-    kubectl apply -f ./rancher-logging.yaml
-
-    # wait few seconds
-    sleep 20
-
-    echo "Wait for rollout of event"
-    # loop wait for at most 3 minutes (18 * 10s)
-    loop_wait_rollout_event 18
-
-    echo "Logging Event Audit: finish upgrading manifest"
-
+    upgrade_logging_event_audit_new_feature
+  elif [[ "$UPGRADE_PREVIOUS_VERSION" = "v1.1.1" ]] ||  [[ "$UPGRADE_PREVIOUS_VERSION" = "v1.1.2" ]]; then
+    # final upgrade path is v1.1.2 -> v1.2.0, but v1.1.2 is not released at 2023.02.10
+    #  v1.1.1 is checked for upgrade test
+    convert_logging_audit_to_addon
+    pause_managed_chart rancher-logging-crd "false"
+  elif [[ "$UPGRADE_PREVIOUS_VERSION" > "v1.1.2" ]]; then
+    # from v1.2.0, only crd here, rancher-logging is upgraded in addons
+    upgrade_managedchart_logging_crd
   else
     echo "Logging Event Audit: nothing to do in $UPGRADE_PREVIOUS_VERSION"
   fi
@@ -614,9 +960,18 @@ EOF
 }
 
 pause_all_charts() {
-  charts="harvester harvester-crd rancher-monitoring rancher-monitoring-crd"
+  charts="harvester harvester-crd rancher-monitoring-crd rancher-logging-crd"
   for chart in $charts; do
     pause_managed_chart $chart "true"
+  done
+
+  # those charts may have been converted to addon, check if they are there first
+  charts="rancher-monitoring rancher-logging"
+  for chart in $charts; do
+    cnt=$(kubectl get managedchart -n fleet-local "$chart" --no-headers | wc -l)
+    if [ "$cnt" -gt 0 ]; then
+      pause_managed_chart $chart "true"
+    fi
   done
 }
 
