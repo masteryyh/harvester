@@ -510,7 +510,16 @@ upgrade_os() {
     tmp_rootfs_squashfs="$NEW_OS_SQUASHFS_IMAGE_FILE"
   else
     tmp_rootfs_squashfs=$(mktemp -p $UPGRADE_TMP_DIR)
+    tmp_rootfs_squashfs_checksum=$(mktemp -p $UPGRADE_TMP_DIR)
     download_file "$UPGRADE_REPO_SQUASHFS_IMAGE" "$tmp_rootfs_squashfs"
+    download_file "$UPGRADE_REPO_SQUASHFS_IMAGE_CHECKSUM" "$tmp_rootfs_squashfs_checksum"
+    sed -i "s/$SQUASHFS_FILENAME/$tmp_rootfs_squashfs/g" $tmp_rootfs_squashfs_checksum
+
+    # verify checksum
+    if [! sha256sum -c "$tmp_rootfs_squashfs_checksum"]; then
+      echo "Checksum verification failed for $tmp_rootfs_squashfs"
+      exit 1
+    fi
   fi
 
   tmp_rootfs_mount=$(mktemp -d -p $HOST_DIR/tmp)
